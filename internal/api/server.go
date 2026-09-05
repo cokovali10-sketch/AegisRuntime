@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/cokovali10-sketch/AegisRuntime/internal/config"
 	"github.com/cokovali10-sketch/AegisRuntime/internal/edr"
 	"github.com/cokovali10-sketch/AegisRuntime/internal/sandbox"
+	"github.com/cokovali10-sketch/AegisRuntime/internal/security"
 )
 
 type Server struct {
@@ -22,6 +25,7 @@ type Server struct {
 	addr        string
 	mux         *http.ServeMux
 	monitorsMu  sync.RWMutex
+	wsManager   *WSManager
 }
 
 type APIResponse struct {
@@ -76,6 +80,28 @@ type MemStats struct {
 	NumGC      uint32 `json:"num_gc"`
 }
 
+type SignRequest struct {
+	KeyName string `json:"key_name"`
+	FilePath string `json:"file_path"`
+}
+
+type VerifyRequest struct {
+	FilePath         string `json:"file_path"`
+	RequireSignature bool   `json:"require_signature"`
+}
+
+type DiagnoseRequest struct {
+	ContainerID string `json:"container_id"`
+	Stderr      string `json:"stderr"`
+	ExitCode    int    `json:"exit_code"`
+	Syscalls    []string `json:"syscalls"`
+}
+
+type ForensicsRequest struct {
+	ContainerID string `json:"container_id"`
+	Action      string `json:"action"`
+}
+
 var startTime = time.Now()
 
 func NewServer(cfg *config.Config, sandboxMgr *sandbox.SandboxManager, addr string) *Server {
@@ -88,6 +114,10 @@ func NewServer(cfg *config.Config, sandboxMgr *sandbox.SandboxManager, addr stri
 	}
 }
 
+func (s *Server) SetWSManager(wsManager *WSManager) {
+	s.wsManager = wsManager
+}
+
 func (s *Server) SetupRoutes() {
 	s.mux.HandleFunc("/api/health", s.handleHealth)
 	s.mux.HandleFunc("/api/sandbox", s.routeSandbox)
@@ -95,6 +125,13 @@ func (s *Server) SetupRoutes() {
 	s.mux.HandleFunc("/api/policies", s.routePolicies)
 	s.mux.HandleFunc("/api/agents", s.handleListAgents)
 	s.mux.HandleFunc("/api/stats", s.handleStats)
+	s.mux.HandleFunc("/api/ws", s.handleWebSocket)
+	s.mux.HandleFunc("/api/stream", s.handleAuditStream)
+	s.mux.HandleFunc("/api/dashboard", s.handleDashboard)
+	s.mux.HandleFunc("/api/forensics", s.handleForensics)
+	s.mux.HandleFunc("/api/sign", s.handleSign)
+	s.mux.HandleFunc("/api/verify", s.handleVerify)
+	s.mux.HandleFunc("/api/diagnose", s.handleDiagnose)
 }
 
 func (s *Server) routeSandbox(w http.ResponseWriter, r *http.Request) {
@@ -250,6 +287,13 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	s.monitors[sbx.ID] = monitor
 	s.monitorsMu.Unlock()
 
+	if s.wsManager != nil {
+		s.wsManager.BroadcastEvent(sbx.ID, "sandbox_created", map[string]interface{}{
+			"sandbox_id": sbx.ID,
+			"agent_id":   sbx.AgentID,
+		})
+	}
+
 	jsonRespond(w, http.StatusCreated, map[string]interface{}{
 		"sandbox": sbx,
 		"result":  result,
@@ -278,6 +322,12 @@ func (s *Server) handleStopSandbox(w http.ResponseWriter, r *http.Request, id st
 
 	if ok {
 		monitor.Stop()
+	}
+
+	if s.wsManager != nil {
+		s.wsManager.BroadcastEvent(id, "sandbox_stopped", map[string]interface{}{
+			"sandbox_id": id,
+		})
 	}
 
 	jsonRespond(w, http.StatusOK, map[string]string{"status": "stopped"})
@@ -415,6 +465,201 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonRespond(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if s.wsManager == nil {
+		jsonError(w, http.StatusInternalServerError, "websocket manager not initialized")
+		return
+	}
+	s.wsManager.HandleWebSocket(w, r)
+}
+
+func (s *Server) handleAuditStream(w http.ResponseWriter, r *http.Request) {
+	if s.wsManager == nil {
+		jsonError(w, http.StatusInternalServerError, "websocket manager not initialized")
+		return
+	}
+	s.wsManager.HandleAuditStream(w, r)
+}
+
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("X-AegisRuntime-Version", "1.0.0")
+	w.Write([]byte(DashboardHTML))
+}
+
+func (s *Server) handleForensics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req ForensicsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ContainerID == "" {
+		jsonError(w, http.StatusBadRequest, "container_id is required")
+		return
+	}
+
+	dumpDir := filepath.Join(s.cfg.RootDir, "dumps")
+	fe := security.NewForensicsEngine(dumpDir)
+
+	switch req.Action {
+	case "list":
+		reports := fe.GetAllReports()
+		jsonRespond(w, http.StatusOK, reports)
+	case "dump":
+		sbx, err := s.sandboxMgr.Get(req.ContainerID)
+		if err != nil {
+			jsonError(w, http.StatusNotFound, "sandbox not found")
+			return
+		}
+
+		dumpPath, err := fe.CreateDump(req.ContainerID, sbx.PID)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		jsonRespond(w, http.StatusOK, map[string]string{
+			"dump_path": dumpPath,
+		})
+	case "report":
+		report := fe.GetReport(req.ContainerID)
+		if report == nil {
+			jsonError(w, http.StatusNotFound, "no crash report found")
+			return
+		}
+		jsonRespond(w, http.StatusOK, report)
+	default:
+		jsonError(w, http.StatusBadRequest, "invalid action: use list, dump, or report")
+	}
+}
+
+func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req SignRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.KeyName == "" || req.FilePath == "" {
+		jsonError(w, http.StatusBadRequest, "key_name and file_path are required")
+		return
+	}
+
+	keyDir := filepath.Join(os.Getenv("HOME"), ".aegis", "keys")
+	se, err := security.NewSigningEngine(keyDir)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	sig, err := se.Sign(req.KeyName, req.FilePath)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	sigPath := req.FilePath + ".sig"
+	if err := se.SaveSignature(sig, sigPath); err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonRespond(w, http.StatusOK, map[string]interface{}{
+		"signed":      true,
+		"file":        req.FilePath,
+		"signature":   sigPath,
+		"fingerprint": sig.ContentHash,
+	})
+}
+
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req VerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.FilePath == "" {
+		jsonError(w, http.StatusBadRequest, "file_path is required")
+		return
+	}
+
+	keyDir := filepath.Join(os.Getenv("HOME"), ".aegis", "keys")
+	se, err := security.NewSigningEngine(keyDir)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	valid, sig, err := se.VerifyFile(req.FilePath)
+	if err != nil {
+		if req.RequireSignature {
+			jsonError(w, http.StatusForbidden, fmt.Sprintf("verification failed: %v", err))
+			return
+		}
+		jsonRespond(w, http.StatusOK, map[string]interface{}{
+			"verified": false,
+			"error":    err.Error(),
+		})
+		return
+	}
+
+	result := map[string]interface{}{
+		"verified": valid,
+	}
+	if sig != nil {
+		result["signed_by"] = sig.SignedBy
+		result["signed_at"] = sig.SignedAt
+		result["algorithm"] = sig.Algorithm
+		result["fingerprint"] = sig.ContentHash
+	}
+
+	jsonRespond(w, http.StatusOK, result)
+}
+
+func (s *Server) handleDiagnose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req DiagnoseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ContainerID == "" {
+		jsonError(w, http.StatusBadRequest, "container_id is required")
+		return
+	}
+
+	dumpDir := filepath.Join(s.cfg.RootDir, "dumps")
+	reportsDir := filepath.Join(s.cfg.RootDir, "reports")
+	sh := security.NewSelfHealer(dumpDir, reportsDir)
+
+	analysis := sh.AnalyzeCrash(req.ContainerID, 0, req.ExitCode, req.Stderr, "", req.Syscalls)
+
+	jsonRespond(w, http.StatusOK, analysis)
 }
 
 func (s *Server) Start() error {

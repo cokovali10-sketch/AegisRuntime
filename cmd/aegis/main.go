@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -46,6 +48,12 @@ func main() {
 			serveCommand(cfg),
 			policyCommand(cfg),
 			scanCommand(cfg),
+			signCommand(cfg),
+			verifyCommand(cfg),
+			keygenCommand(cfg),
+			diagnoseCommand(cfg),
+			forensicsCommand(cfg),
+			dashboardCommand(cfg),
 		},
 	}
 
@@ -261,6 +269,8 @@ func serveCommand(cfg *config.Config) *cli.Command {
 		Action: func(c *cli.Context) error {
 			mgr := sandbox.NewManager(cfg)
 			server := api.NewServer(cfg, mgr, c.String("addr"))
+			wsManager := api.NewWSManager()
+			server.SetWSManager(wsManager)
 			server.SetupRoutes()
 
 			fmt.Printf("AegisRuntime API server starting on %s\n", c.String("addr"))
@@ -358,6 +368,349 @@ func scanCommand(cfg *config.Config) *cli.Command {
 	}
 }
 
+func signCommand(cfg *config.Config) *cli.Command {
+	return &cli.Command{
+		Name:      "sign",
+		Usage:     "Sign an artifact",
+		ArgsUsage: "<file>",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "key", Required: true, Usage: "Key name to sign with"},
+		},
+		Action: func(c *cli.Context) error {
+			if c.NArg() == 0 {
+				return fmt.Errorf("file required")
+			}
+			filePath := c.Args().First()
+			keyName := c.String("key")
+
+			keyDir := filepath.Join(os.Getenv("HOME"), ".aegis", "keys")
+			se, err := security.NewSigningEngine(keyDir)
+			if err != nil {
+				return fmt.Errorf("init signing engine: %w", err)
+			}
+
+			sig, err := se.Sign(keyName, filePath)
+			if err != nil {
+				return fmt.Errorf("sign: %w", err)
+			}
+
+			sigPath := filePath + ".sig"
+			if err := se.SaveSignature(sig, sigPath); err != nil {
+				return fmt.Errorf("save signature: %w", err)
+			}
+
+			fmt.Printf("Signed %s → %s\n", filePath, sigPath)
+			return nil
+		},
+	}
+}
+
+func verifyCommand(cfg *config.Config) *cli.Command {
+	return &cli.Command{
+		Name:      "verify",
+		Usage:     "Verify artifact signature",
+		ArgsUsage: "<file>",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "require-signature", Usage: "Exit with error if no valid signature"},
+		},
+		Action: func(c *cli.Context) error {
+			if c.NArg() == 0 {
+				return fmt.Errorf("file required")
+			}
+			filePath := c.Args().First()
+
+			keyDir := filepath.Join(os.Getenv("HOME"), ".aegis", "keys")
+			se, err := security.NewSigningEngine(keyDir)
+			if err != nil {
+				return fmt.Errorf("init signing engine: %w", err)
+			}
+
+			valid, sig, err := se.VerifyFile(filePath)
+			if err != nil {
+				if c.Bool("require-signature") {
+					fmt.Println("✗ Invalid/missing signature")
+					return fmt.Errorf("verification failed: %w", err)
+				}
+				fmt.Println("✗ Invalid/missing signature")
+				return nil
+			}
+
+			if valid {
+				fmt.Println("✓ Verified")
+				_ = sig
+			} else {
+				fmt.Println("✗ Invalid/missing signature")
+				if c.Bool("require-signature") {
+					return fmt.Errorf("signature verification failed")
+				}
+			}
+			return nil
+		},
+	}
+}
+
+func keygenCommand(cfg *config.Config) *cli.Command {
+	return &cli.Command{
+		Name:  "keygen",
+		Usage: "Generate signing keys",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "name", Required: true, Usage: "Key name"},
+			&cli.BoolFlag{Name: "force", Usage: "Overwrite existing key"},
+		},
+		Action: func(c *cli.Context) error {
+			keyName := c.String("name")
+			keyDir := filepath.Join(os.Getenv("HOME"), ".aegis", "keys")
+
+			se, err := security.NewSigningEngine(keyDir)
+			if err != nil {
+				return fmt.Errorf("init signing engine: %w", err)
+			}
+
+			if !c.Bool("force") {
+				for _, existing := range se.ListKeys() {
+					if existing == keyName {
+						return fmt.Errorf("key %q already exists (use --force to overwrite)", keyName)
+					}
+				}
+			}
+
+			_, err = se.GenerateKeyPair(keyName)
+			if err != nil {
+				return fmt.Errorf("generate key pair: %w", err)
+			}
+
+			fmt.Printf("Key pair generated: %s\n", keyName)
+			return nil
+		},
+	}
+}
+
+func diagnoseCommand(cfg *config.Config) *cli.Command {
+	return &cli.Command{
+		Name:      "diagnose",
+		Usage:     "Diagnose crash",
+		ArgsUsage: "<container-id>",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
+		},
+		Action: func(c *cli.Context) error {
+			if c.NArg() == 0 {
+				return fmt.Errorf("container ID required")
+			}
+			containerID := c.Args().First()
+
+			dumpDir := filepath.Join(cfg.RootDir, "dumps")
+			reportsDir := filepath.Join(cfg.RootDir, "reports")
+			sh := security.NewSelfHealer(dumpDir, reportsDir)
+
+			analysis := sh.AnalyzeCrash(containerID, 0, 0, "", "", nil)
+
+			if c.Bool("json") {
+				data, _ := json.MarshalIndent(analysis, "", "  ")
+				fmt.Println(string(data))
+			} else {
+				fmt.Printf("Container:   %s\n", analysis.ContainerID)
+				fmt.Printf("Severity:    %s\n", analysis.Severity)
+				fmt.Printf("Category:    %s\n", analysis.Category)
+				fmt.Printf("Diagnosis:   %s\n", analysis.Diagnosis)
+				if len(analysis.FixSuggestions) > 0 {
+					fmt.Println("Suggestions:")
+					for _, s := range analysis.FixSuggestions {
+						fmt.Printf("  - %s\n", s)
+					}
+				}
+			}
+			return nil
+		},
+	}
+}
+
+func forensicsCommand(cfg *config.Config) *cli.Command {
+	return &cli.Command{
+		Name:  "forensics",
+		Usage: "Memory forensics operations",
+		Subcommands: []*cli.Command{
+			{
+				Name:  "list",
+				Usage: "List forensics data",
+				Action: func(c *cli.Context) error {
+					dumpDir := filepath.Join(cfg.RootDir, "dumps")
+					fe := security.NewForensicsEngine(dumpDir)
+
+					reports := fe.GetAllReports()
+					if len(reports) == 0 {
+						fmt.Println("No forensics data available.")
+						return nil
+					}
+
+					fmt.Printf("%-20s %-10s %-10s %s\n", "CONTAINER", "EXIT", "MEMORY", "TIME")
+					fmt.Println(strings.Repeat("-", 70))
+					for containerID, containerReports := range reports {
+						for _, r := range containerReports {
+							fmt.Printf("%-20s %-10d %-10.1f %s\n",
+								containerID[:min(20, len(containerID))],
+								r.ExitCode,
+								r.MemoryPeak,
+								r.Timestamp.Format("Jan 02 15:04"))
+						}
+					}
+					return nil
+				},
+			},
+			{
+				Name:      "dump",
+				Usage:     "Create memory dump for container",
+				ArgsUsage: "<container-id>",
+				Action: func(c *cli.Context) error {
+					if c.NArg() == 0 {
+						return fmt.Errorf("container ID required")
+					}
+					containerID := c.Args().First()
+					dumpDir := filepath.Join(cfg.RootDir, "dumps")
+					fe := security.NewForensicsEngine(dumpDir)
+
+					pid, err := findContainerPID(containerID)
+					if err != nil {
+						return fmt.Errorf("find container PID: %w", err)
+					}
+
+					dumpPath, err := fe.CreateDump(containerID, pid)
+					if err != nil {
+						return fmt.Errorf("create dump: %w", err)
+					}
+
+					fmt.Printf("Memory dump created: %s\n", dumpPath)
+					return nil
+				},
+			},
+			{
+				Name:      "report",
+				Usage:     "Show crash report for container",
+				ArgsUsage: "<container-id>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "json", Usage: "Output as JSON"},
+				},
+				Action: func(c *cli.Context) error {
+					if c.NArg() == 0 {
+						return fmt.Errorf("container ID required")
+					}
+					containerID := c.Args().First()
+					dumpDir := filepath.Join(cfg.RootDir, "dumps")
+					fe := security.NewForensicsEngine(dumpDir)
+
+					report := fe.GetReport(containerID)
+					if report == nil {
+						fmt.Printf("No crash report found for container %s\n", containerID)
+						return nil
+					}
+
+					if c.Bool("json") {
+						data, _ := json.MarshalIndent(report, "", "  ")
+						fmt.Println(string(data))
+					} else {
+						summary := fe.GenerateSummary(containerID)
+						fmt.Print(summary)
+					}
+					return nil
+				},
+			},
+		},
+	}
+}
+
+func dashboardCommand(cfg *config.Config) *cli.Command {
+	return &cli.Command{
+		Name:  "dashboard",
+		Usage: "Start web dashboard",
+		Flags: []cli.Flag{
+			&cli.IntFlag{Name: "port", Value: 8081, Usage: "Dashboard port"},
+		},
+		Action: func(c *cli.Context) error {
+			port := c.Int("port")
+			addr := fmt.Sprintf(":%d", port)
+
+			fmt.Printf("AegisRuntime Dashboard starting on http://localhost%s\n", addr)
+			fmt.Printf("WebSocket endpoint: ws://localhost%s/api/ws\n", addr)
+
+			mgr := sandbox.NewManager(cfg)
+			server := api.NewServer(cfg, mgr, addr)
+			wsManager := api.NewWSManager()
+			server.SetWSManager(wsManager)
+			server.SetupRoutes()
+
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				url := fmt.Sprintf("http://localhost%s", addr)
+				openBrowser(url)
+			}()
+
+			return server.Start()
+		},
+	}
+}
+
+func openBrowser(url string) {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default:
+		cmd = "xdg-open"
+		args = []string{url}
+	}
+
+	c := execCommand(cmd, args...)
+	_ = c.Start()
+}
+
+func execCommand(name string, args ...string) *execCmd {
+	return &execCmd{name: name, args: args}
+}
+
+type execCmd struct {
+	name string
+	args []string
+}
+
+func (c *execCmd) Start() error {
+	return nil
+}
+
+func findContainerPID(containerID string) (int, error) {
+	cgroupPath := filepath.Join("/sys/fs/cgroup", containerID)
+	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
+
+	data, err := os.ReadFile(procsPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read cgroup.procs for %s: %w", containerID, err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		return 0, fmt.Errorf("no processes found in cgroup %s", containerID)
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse PID: %w", err)
+	}
+
+	return pid, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func handleSignals(mgr *sandbox.SandboxManager) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
@@ -401,7 +754,7 @@ func printBanner() {
 /  /_\  \   | (_____ | |   | || (___
 /  _____  \ (_____  )| |   | |  ___)
 /  /     \  \      ) | |   | | (
-/  /       \  /\    | | (___) || (____/\
+/  /       \  /\    | | (___) || (____/\ 
 /__/         \/  \___| (_______)(_______/
 `)
 	fmt.Println("AI-Native Secure Sandbox & Micro-Runtime v1.0.0")
