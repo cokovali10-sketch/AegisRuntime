@@ -253,8 +253,20 @@ func (sm *SandboxManager) Get(sandboxID string) (*Sandbox, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	cp := *s
-	return &cp, nil
+	return &Sandbox{
+		ID:         s.ID,
+		AgentID:    s.AgentID,
+		RootfsPath: s.RootfsPath,
+		CgroupPath: s.CgroupPath,
+		PID:        s.PID,
+		Status:     s.Status,
+		Config:     s.Config,
+		CreatedAt:  s.CreatedAt,
+		StartedAt:  s.StartedAt,
+		ExitCode:   s.ExitCode,
+		Output:     s.Output,
+		Error:      s.Error,
+	}, nil
 }
 
 func (sm *SandboxManager) List() []*Sandbox {
@@ -264,9 +276,21 @@ func (sm *SandboxManager) List() []*Sandbox {
 	result := make([]*Sandbox, 0, len(sm.sandboxes))
 	for _, s := range sm.sandboxes {
 		s.mu.RLock()
-		cp := *s
+		result = append(result, &Sandbox{
+			ID:         s.ID,
+			AgentID:    s.AgentID,
+			RootfsPath: s.RootfsPath,
+			CgroupPath: s.CgroupPath,
+			PID:        s.PID,
+			Status:     s.Status,
+			Config:     s.Config,
+			CreatedAt:  s.CreatedAt,
+			StartedAt:  s.StartedAt,
+			ExitCode:   s.ExitCode,
+			Output:     s.Output,
+			Error:      s.Error,
+		})
 		s.mu.RUnlock()
-		result = append(result, &cp)
 	}
 	return result
 }

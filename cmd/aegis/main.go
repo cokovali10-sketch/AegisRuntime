@@ -747,7 +747,7 @@ func formatDuration(d time.Duration) string {
 }
 
 func printBanner() {
-	fmt.Println(`
+	fmt.Print(`
    ___        _______  _______  _______
   /   \     (  ____ \(  ___  )(  ____ \
  /  ^  \    | (    \/| (   ) || (    \/
